@@ -25,8 +25,22 @@ type Config struct {
 }
 
 type ChatMessage struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
+	Role       string     `json:"role"`
+	Content    string     `json:"content"`
+	Name       string     `json:"name,omitempty"`
+	ToolCallID string     `json:"tool_call_id,omitempty"`
+	ToolCalls  []ToolCall `json:"tool_calls,omitempty"`
+}
+
+type ToolCall struct {
+	ID       string           `json:"id"`
+	Type     string           `json:"type"`
+	Function ToolCallFunction `json:"function"`
+}
+
+type ToolCallFunction struct {
+	Name      string `json:"name"`
+	Arguments string `json:"arguments"`
 }
 
 type llmClient interface {
@@ -85,7 +99,7 @@ func main() {
 		return scanner.Text(), true
 	}
 
-	tools := []ToolDefinition{}
+	tools := []ToolDefinition{ReadFileTool}
 	agent := NewAgent(newOpenAIClient(cfg, nil, tools), getUserMessage, tools)
 	if err := agent.Run(context.Background()); err != nil {
 		log.Fatalf("run agent: %v", err)
@@ -148,14 +162,69 @@ func (a *Agent) Run(ctx context.Context) error {
 			Content: userInput,
 		})
 
-		reply, err := a.client.runInference(ctx, conversation)
+		updatedConversation, reply, err := a.runAssistantTurn(ctx, conversation)
 		if err != nil {
 			return err
 		}
 
-		conversation = append(conversation, reply)
+		conversation = updatedConversation
 		log.Printf("Agent: %s", reply.Content)
 	}
+}
+
+func (a *Agent) runAssistantTurn(ctx context.Context, conversation []ChatMessage) ([]ChatMessage, ChatMessage, error) {
+	for {
+		reply, err := a.client.runInference(ctx, conversation)
+		if err != nil {
+			return nil, ChatMessage{}, err
+		}
+
+		conversation = append(conversation, reply)
+		if len(reply.ToolCalls) == 0 {
+			return conversation, reply, nil
+		}
+
+		toolReplies, err := a.executeToolCalls(reply.ToolCalls)
+		if err != nil {
+			return nil, ChatMessage{}, err
+		}
+		conversation = append(conversation, toolReplies...)
+	}
+}
+
+func (a *Agent) executeToolCalls(toolCalls []ToolCall) ([]ChatMessage, error) {
+	replies := make([]ChatMessage, 0, len(toolCalls))
+	for _, toolCall := range toolCalls {
+
+		definition, ok := a.findTool(toolCall.Function.Name)
+		if !ok {
+			return nil, fmt.Errorf("tool %q not registered", toolCall.Function.Name)
+		}
+
+		output, err := definition.Function(json.RawMessage(toolCall.Function.Arguments))
+		if err != nil {
+			return nil, fmt.Errorf("execute tool %q: %w", toolCall.Function.Name, err)
+		}
+
+		replies = append(replies, ChatMessage{
+			Role:       "tool",
+			Name:       definition.Name,
+			ToolCallID: toolCall.ID,
+			Content:    output,
+		})
+	}
+
+	return replies, nil
+}
+
+func (a *Agent) findTool(name string) (ToolDefinition, bool) {
+	for _, definition := range a.tools {
+		if definition.Name == name {
+			return definition, true
+		}
+	}
+
+	return ToolDefinition{}, false
 }
 
 func newOpenAIClient(cfg Config, httpClient *http.Client, tools []ToolDefinition) *openAIClient {
@@ -257,4 +326,43 @@ type ToolDefinition struct {
 	Description string                                   `json:"description"`
 	Parameters  json.RawMessage                          `json:"parameters,omitempty"`
 	Function    func(in json.RawMessage) (string, error) `json:"-"`
+}
+
+var ReadFileTool = ToolDefinition{
+	Name:        "read_file",
+	Description: "Read the contents of a file from a local path.",
+	Parameters: json.RawMessage(`{
+		"type": "object",
+		"properties": {
+			"path": {
+				"type": "string",
+				"description": "The absolute or relative local path to the file."
+			}
+		},
+		"required": ["path"],
+		"additionalProperties": false
+	}`),
+	Function: readFile,
+}
+
+func readFile(input json.RawMessage) (string, error) {
+	var request struct {
+		Path string `json:"path"`
+	}
+
+	if err := json.Unmarshal(input, &request); err != nil {
+		return "", fmt.Errorf("parse read_file input: %w", err)
+	}
+
+	request.Path = strings.TrimSpace(request.Path)
+	if request.Path == "" {
+		return "", fmt.Errorf("read_file requires a non-empty path")
+	}
+
+	data, err := os.ReadFile(request.Path)
+	if err != nil {
+		return "", fmt.Errorf("read %s: %w", request.Path, err)
+	}
+
+	return string(data), nil
 }
