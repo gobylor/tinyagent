@@ -22,6 +22,7 @@ type Config struct {
 	APIKey  string `json:"api_key"`
 	BaseURL string `json:"base_url"`
 	Model   string `json:"model"`
+	Debug   bool   `json:"debug"`
 }
 
 type ChatMessage struct {
@@ -59,6 +60,7 @@ type openAIClient struct {
 	apiKey      string
 	model       string
 	tools       []openAIChatTool
+	debug       bool
 }
 
 type openAIChatRequest struct {
@@ -195,6 +197,7 @@ func (a *Agent) runAssistantTurn(ctx context.Context, conversation []ChatMessage
 func (a *Agent) executeToolCalls(toolCalls []ToolCall) ([]ChatMessage, error) {
 	replies := make([]ChatMessage, 0, len(toolCalls))
 	for _, toolCall := range toolCalls {
+		logToolCall(toolCall.Function.Name, toolCall.Function.Arguments)
 
 		definition, ok := a.findTool(toolCall.Function.Name)
 		if !ok {
@@ -205,6 +208,7 @@ func (a *Agent) executeToolCalls(toolCalls []ToolCall) ([]ChatMessage, error) {
 		if err != nil {
 			return nil, fmt.Errorf("execute tool %q: %w", toolCall.Function.Name, err)
 		}
+		logToolResult(toolCall.Function.Name, output)
 
 		replies = append(replies, ChatMessage{
 			Role:       "tool",
@@ -238,6 +242,7 @@ func newOpenAIClient(cfg Config, httpClient *http.Client, tools []ToolDefinition
 		apiKey:      cfg.APIKey,
 		model:       cfg.Model,
 		tools:       buildOpenAIChatTools(tools),
+		debug:       cfg.Debug,
 	}
 }
 
@@ -251,6 +256,7 @@ func (c *openAIClient) runInference(ctx context.Context, conversation []ChatMess
 	if err != nil {
 		return ChatMessage{}, fmt.Errorf("marshal chat request: %w", err)
 	}
+	c.logDebugRequest(requestBody)
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.endpointURL, bytes.NewReader(requestBody))
 	if err != nil {
@@ -269,6 +275,7 @@ func (c *openAIClient) runInference(ctx context.Context, conversation []ChatMess
 	if err != nil {
 		return ChatMessage{}, fmt.Errorf("read chat response: %w", err)
 	}
+	c.logDebugResponse(resp.StatusCode, responseBody)
 
 	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
 		return ChatMessage{}, fmt.Errorf("chat completion request failed with status %d: %s", resp.StatusCode, strings.TrimSpace(string(responseBody)))
@@ -287,6 +294,22 @@ func (c *openAIClient) runInference(ctx context.Context, conversation []ChatMess
 		reply.Role = "assistant"
 	}
 	return reply, nil
+}
+
+func (c *openAIClient) logDebugRequest(body []byte) {
+	if !c.debug {
+		return
+	}
+
+	log.Printf("OpenAI request\n  body:\n%s", indentLines(prettyLogBody(body), "    "))
+}
+
+func (c *openAIClient) logDebugResponse(statusCode int, body []byte) {
+	if !c.debug {
+		return
+	}
+
+	log.Printf("OpenAI response\n  status: %d\n  body:\n%s", statusCode, indentLines(prettyLogBody(body), "    "))
 }
 
 func buildChatCompletionsURL(baseURL string) string {
@@ -326,6 +349,60 @@ type ToolDefinition struct {
 	Description string                                   `json:"description"`
 	Parameters  json.RawMessage                          `json:"parameters,omitempty"`
 	Function    func(in json.RawMessage) (string, error) `json:"-"`
+}
+
+func summarizeToolOutput(output string) (int, string, bool) {
+	const previewLimit = 200
+
+	preview := output
+	truncated := false
+	if len(preview) > previewLimit {
+		preview = preview[:previewLimit]
+		truncated = true
+	}
+
+	return len(output), preview, truncated
+}
+
+func logToolCall(name, arguments string) {
+	log.Printf("Tool call\n  name: %s\n  args:\n%s", name, indentLines(prettyLogBody([]byte(arguments)), "    "))
+}
+
+func logToolResult(name, output string) {
+	size, preview, truncated := summarizeToolOutput(output)
+	summary := fmt.Sprintf("%d bytes", size)
+	if truncated {
+		summary += " [truncated]"
+	}
+
+	log.Printf("Tool result\n  name: %s\n  summary: %s\n  preview: %q", name, summary, preview)
+}
+
+func prettyLogBody(body []byte) string {
+	trimmed := bytes.TrimSpace(body)
+	if len(trimmed) == 0 {
+		return "{}"
+	}
+
+	var formatted bytes.Buffer
+	if err := json.Indent(&formatted, trimmed, "", "  "); err == nil {
+		return formatted.String()
+	}
+
+	return string(trimmed)
+}
+
+func indentLines(input, prefix string) string {
+	if input == "" {
+		return prefix
+	}
+
+	lines := strings.Split(input, "\n")
+	for i, line := range lines {
+		lines[i] = prefix + line
+	}
+
+	return strings.Join(lines, "\n")
 }
 
 var ReadFileTool = ToolDefinition{
