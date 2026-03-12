@@ -36,6 +36,7 @@ type llmClient interface {
 type Agent struct {
 	client         llmClient
 	getUserMessage func() (string, bool)
+	tools          []ToolDefinition
 }
 
 type openAIClient struct {
@@ -43,18 +44,31 @@ type openAIClient struct {
 	endpointURL string
 	apiKey      string
 	model       string
+	tools       []openAIChatTool
 }
 
 type openAIChatRequest struct {
-	Model     string        `json:"model"`
-	Messages  []ChatMessage `json:"messages"`
-	MaxTokens int           `json:"max_tokens"`
+	Model     string           `json:"model"`
+	Messages  []ChatMessage    `json:"messages"`
+	MaxTokens int              `json:"max_tokens"`
+	Tools     []openAIChatTool `json:"tools,omitempty"`
 }
 
 type openAIChatResponse struct {
 	Choices []struct {
 		Message ChatMessage `json:"message"`
 	} `json:"choices"`
+}
+
+type openAIChatTool struct {
+	Type     string                 `json:"type"`
+	Function openAIChatToolFunction `json:"function"`
+}
+
+type openAIChatToolFunction struct {
+	Name        string          `json:"name"`
+	Description string          `json:"description,omitempty"`
+	Parameters  json.RawMessage `json:"parameters,omitempty"`
 }
 
 func main() {
@@ -71,7 +85,8 @@ func main() {
 		return scanner.Text(), true
 	}
 
-	agent := NewAgent(newOpenAIClient(cfg, nil), getUserMessage)
+	tools := []ToolDefinition{}
+	agent := NewAgent(newOpenAIClient(cfg, nil, tools), getUserMessage, tools)
 	if err := agent.Run(context.Background()); err != nil {
 		log.Fatalf("run agent: %v", err)
 	}
@@ -104,10 +119,11 @@ func loadConfig(path string) (Config, error) {
 	return cfg, nil
 }
 
-func NewAgent(client llmClient, getUserMessage func() (string, bool)) *Agent {
+func NewAgent(client llmClient, getUserMessage func() (string, bool), tools []ToolDefinition) *Agent {
 	return &Agent{
 		client:         client,
 		getUserMessage: getUserMessage,
+		tools:          tools,
 	}
 }
 
@@ -142,7 +158,7 @@ func (a *Agent) Run(ctx context.Context) error {
 	}
 }
 
-func newOpenAIClient(cfg Config, httpClient *http.Client) *openAIClient {
+func newOpenAIClient(cfg Config, httpClient *http.Client, tools []ToolDefinition) *openAIClient {
 	if httpClient == nil {
 		httpClient = http.DefaultClient
 	}
@@ -152,6 +168,7 @@ func newOpenAIClient(cfg Config, httpClient *http.Client) *openAIClient {
 		endpointURL: buildChatCompletionsURL(cfg.BaseURL),
 		apiKey:      cfg.APIKey,
 		model:       cfg.Model,
+		tools:       buildOpenAIChatTools(tools),
 	}
 }
 
@@ -160,6 +177,7 @@ func (c *openAIClient) runInference(ctx context.Context, conversation []ChatMess
 		Model:     c.model,
 		Messages:  conversation,
 		MaxTokens: defaultMaxTokens,
+		Tools:     c.tools,
 	})
 	if err != nil {
 		return ChatMessage{}, fmt.Errorf("marshal chat request: %w", err)
@@ -212,4 +230,31 @@ func buildChatCompletionsURL(baseURL string) string {
 	default:
 		return trimmed + "/v1/chat/completions"
 	}
+}
+
+func buildOpenAIChatTools(definitions []ToolDefinition) []openAIChatTool {
+	if len(definitions) == 0 {
+		return nil
+	}
+
+	tools := make([]openAIChatTool, 0, len(definitions))
+	for _, definition := range definitions {
+		tools = append(tools, openAIChatTool{
+			Type: "function",
+			Function: openAIChatToolFunction{
+				Name:        definition.Name,
+				Description: definition.Description,
+				Parameters:  definition.Parameters,
+			},
+		})
+	}
+
+	return tools
+}
+
+type ToolDefinition struct {
+	Name        string                                   `json:"name"`
+	Description string                                   `json:"description"`
+	Parameters  json.RawMessage                          `json:"parameters,omitempty"`
+	Function    func(in json.RawMessage) (string, error) `json:"-"`
 }
